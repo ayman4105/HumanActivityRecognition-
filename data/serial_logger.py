@@ -5,7 +5,7 @@ import os                             # Import os library to create folders
 
 SERIAL_PORT = "/dev/ttyACM0"          # Set ESP32 serial port, change if needed
 BAUD_RATE = 115200                    # Set baud rate, must match Arduino Serial.begin()
-LABEL = "idle"                        # Set current activity label
+LABEL = "left_tilt"                        # Set current activity label
 OUTPUT_FOLDER = "dataset"             # Set output folder name
 OUTPUT_FILE = f"{OUTPUT_FOLDER}/{LABEL}.csv"  # Set output CSV file path
 

@@ -1,13 +1,22 @@
 /*
-  Stage 2 — IDLE Dataset Collection
+  Stage 2 — Dataset Collection
   TinyML Human Activity Recognition
 
-  Calibration Rule:
-    Keep the board FLAT, STILL, and in the official IDLE neutral position.
-    Do not touch the sensor during calibration.
+  Important update:
+    - Accelerometer range is now +/-8g
+    - ACCEL_SCALE = 4096.0
+    - ACCEL_CONFIG = 0x10
+
+  Why?
+    - Your X accelerometer axis was saturating at 32767 using +/-2g
+    - Using +/-8g gives more range and avoids clipping during movement
 
   CSV Output:
     timestamp,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,label
+
+  Calibration Rule:
+    - During calibration, keep the board flat, still, and in neutral idle position
+    - After DATASET_COLLECTION_STARTED appears, start the required movement
 */
 
 #include <Wire.h>                         /* Include Wire library for I2C communication */
@@ -19,8 +28,13 @@
 #define SDA_PIN 8                         /* ESP32-S3 SDA pin connected to MPU6050 SDA */
 #define SCL_PIN 9                         /* ESP32-S3 SCL pin connected to MPU6050 SCL */
 
+/*
+  If your working pins are GPIO4 and GPIO5, change only these two lines:
+  #define SDA_PIN 4
+  #define SCL_PIN 5
+*/
 
-const char CURRENT_LABEL[] = "idle";      /* Fixed label for this dataset file */
+const char CURRENT_LABEL[] = "left_tilt";      /* Change this label for each class */
 const unsigned long SAMPLE_DELAY_MS = 50; /* 50 ms = about 20 samples per second */
 
 /* =========================
@@ -29,7 +43,7 @@ const unsigned long SAMPLE_DELAY_MS = 50; /* 50 ms = about 20 samples per second
 
 #define MPU_ADDR 0x68                     /* MPU6050 I2C address when AD0 is connected to GND */
 #define REG_WHO_AM_I 0x75                 /* Register used to check sensor identity */
-#define REG_PWR_MGMT_1 0x6B               /* Register used to wake up the sensor */
+#define REG_PWR_MGMT_1 0x6B               /* Register used to wake up or reset MPU6050 */
 #define REG_ACCEL_CONFIG 0x1C             /* Register used to set accelerometer range */
 #define REG_GYRO_CONFIG 0x1B              /* Register used to set gyroscope range */
 #define REG_ACCEL_XOUT_H 0x3B             /* First register of accelerometer data block */
@@ -38,56 +52,56 @@ const unsigned long SAMPLE_DELAY_MS = 50; /* 50 ms = about 20 samples per second
    Scale Factors
    ========================= */
 
-const float ACCEL_SCALE = 16384.0f;        /* +/-2g range: 16384 raw counts = 1g */
+const float ACCEL_SCALE = 4096.0f;         /* +/-8g range: 4096 raw counts = 1g */
 const float GYRO_SCALE = 131.0f;           /* +/-250 dps range: 131 raw counts = 1 deg/s */
 
 /* =========================
-   Calibration Bias
+   Calibration Bias Variables
    ========================= */
 
-float accelBiasX = 0.0f;                   /* Accelerometer X bias in g */
-float accelBiasY = 0.0f;                   /* Accelerometer Y bias in g */
-float accelBiasZ = 0.0f;                   /* Accelerometer Z bias in g */
+float accelBiasX = 0.0f;                   /* Store accelerometer X bias in g */
+float accelBiasY = 0.0f;                   /* Store accelerometer Y bias in g */
+float accelBiasZ = 0.0f;                   /* Store accelerometer Z bias in g */
 
-float gyroBiasX = 0.0f;                    /* Gyroscope X bias in deg/s */
-float gyroBiasY = 0.0f;                    /* Gyroscope Y bias in deg/s */
-float gyroBiasZ = 0.0f;                    /* Gyroscope Z bias in deg/s */
+float gyroBiasX = 0.0f;                    /* Store gyroscope X bias in deg/s */
+float gyroBiasY = 0.0f;                    /* Store gyroscope Y bias in deg/s */
+float gyroBiasZ = 0.0f;                    /* Store gyroscope Z bias in deg/s */
 
 /* =========================
-   Filter Variables
+   Low Pass Filter Variables
    ========================= */
 
-float filtAx = 0.0f;                       /* Filtered accelerometer X */
-float filtAy = 0.0f;                       /* Filtered accelerometer Y */
-float filtAz = 0.0f;                       /* Filtered accelerometer Z */
+float filtAx = 0.0f;                       /* Store filtered accelerometer X value */
+float filtAy = 0.0f;                       /* Store filtered accelerometer Y value */
+float filtAz = 0.0f;                       /* Store filtered accelerometer Z value */
 
-float filtGx = 0.0f;                       /* Filtered gyroscope X */
-float filtGy = 0.0f;                       /* Filtered gyroscope Y */
-float filtGz = 0.0f;                       /* Filtered gyroscope Z */
+float filtGx = 0.0f;                       /* Store filtered gyroscope X value */
+float filtGy = 0.0f;                       /* Store filtered gyroscope Y value */
+float filtGz = 0.0f;                       /* Store filtered gyroscope Z value */
 
 const float ALPHA = 0.2f;                  /* Low-pass filter factor */
 
 /* =========================
-   MPU6050 Write Function
+   Write One Byte to MPU6050
    ========================= */
 
 void mpuWriteByte(uint8_t reg, uint8_t value)
 {
-    Wire.beginTransmission(MPU_ADDR);      /* Start I2C communication with MPU6050 */
+    Wire.beginTransmission(MPU_ADDR);      /* Start I2C transmission to MPU6050 */
     Wire.write(reg);                       /* Send register address */
     Wire.write(value);                     /* Send value to register */
-    Wire.endTransmission();                /* End I2C communication */
+    Wire.endTransmission();                /* End I2C transmission */
 }
 
 /* =========================
-   MPU6050 Read One Byte
+   Read One Byte from MPU6050
    ========================= */
 
 uint8_t mpuReadByte(uint8_t reg)
 {
-    Wire.beginTransmission(MPU_ADDR);      /* Start I2C communication with MPU6050 */
+    Wire.beginTransmission(MPU_ADDR);      /* Start I2C transmission to MPU6050 */
     Wire.write(reg);                       /* Send register address */
-    Wire.endTransmission(false);           /* Keep bus active using repeated start */
+    Wire.endTransmission(false);           /* Send repeated start without releasing bus */
 
     Wire.requestFrom(MPU_ADDR, 1, true);   /* Request one byte from MPU6050 */
 
@@ -103,28 +117,28 @@ int16_t readInt16()
     uint8_t highByte = Wire.read();        /* Read high byte */
     uint8_t lowByte = Wire.read();         /* Read low byte */
 
-    return (int16_t)((highByte << 8) | lowByte); /* Combine two bytes into signed 16-bit value */
+    return (int16_t)((highByte << 8) | lowByte); /* Combine high and low bytes */
 }
 
 /* =========================
-   Read Raw Sensor Data
+   Read Raw MPU6050 Data
    ========================= */
 
 bool mpuReadRaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz)
 {
-    Wire.beginTransmission(MPU_ADDR);      /* Start I2C communication */
+    Wire.beginTransmission(MPU_ADDR);      /* Start I2C communication with MPU6050 */
     Wire.write(REG_ACCEL_XOUT_H);          /* Select first data register */
 
     if (Wire.endTransmission(false) != 0)  /* Check if sensor responded */
     {
-        return false;                      /* Return false if I2C failed */
+        return false;                      /* Return false if I2C communication failed */
     }
 
     uint8_t bytesReceived = Wire.requestFrom(MPU_ADDR, 14, true); /* Request acc + temp + gyro */
 
-    if (bytesReceived != 14)               /* Check if all bytes arrived */
+    if (bytesReceived != 14)               /* Check if all 14 bytes arrived */
     {
-        return false;                      /* Return false if data is incomplete */
+        return false;                      /* Return false if reading is incomplete */
     }
 
     ax = readInt16();                      /* Read raw accelerometer X */
@@ -137,47 +151,47 @@ bool mpuReadRaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy,
     gy = readInt16();                      /* Read raw gyroscope Y */
     gz = readInt16();                      /* Read raw gyroscope Z */
 
-    return true;                           /* Return true when reading succeeds */
+    return true;                           /* Return true if reading succeeded */
 }
 
 /* =========================
-   Calibration Function
+   Sensor Calibration
    ========================= */
 
 void calibrateSensor(int numSamples = 500)
 {
     Serial.println("CALIBRATION_START");
-    Serial.println("Keep board FLAT, STILL, and in IDLE neutral position");
-    Serial.println("Do not touch the board");
+    Serial.println("Keep board FLAT, STILL, and in neutral IDLE position");
+    Serial.println("Do not touch the board during calibration");
 
-    delay(2000);                           /* Give user time before calibration */
+    delay(2000);                           /* Give user time before calibration starts */
 
-    double sumAx = 0.0;                    /* Sum accelerometer X */
-    double sumAy = 0.0;                    /* Sum accelerometer Y */
-    double sumAz = 0.0;                    /* Sum accelerometer Z */
+    double sumAx = 0.0;                    /* Sum accelerometer X values */
+    double sumAy = 0.0;                    /* Sum accelerometer Y values */
+    double sumAz = 0.0;                    /* Sum accelerometer Z values */
 
-    double sumGx = 0.0;                    /* Sum gyroscope X */
-    double sumGy = 0.0;                    /* Sum gyroscope Y */
-    double sumGz = 0.0;                    /* Sum gyroscope Z */
+    double sumGx = 0.0;                    /* Sum gyroscope X values */
+    double sumGy = 0.0;                    /* Sum gyroscope Y values */
+    double sumGz = 0.0;                    /* Sum gyroscope Z values */
 
     int validSamples = 0;                  /* Count valid calibration samples */
 
     for (int i = 0; i < numSamples; i++)   /* Collect calibration samples */
     {
-        int16_t axRaw, ayRaw, azRaw;       /* Store raw accelerometer values */
-        int16_t gxRaw, gyRaw, gzRaw;       /* Store raw gyroscope values */
+        int16_t axRaw, ayRaw, azRaw;       /* Store raw accelerometer readings */
+        int16_t gxRaw, gyRaw, gzRaw;       /* Store raw gyroscope readings */
 
         if (mpuReadRaw(axRaw, ayRaw, azRaw, gxRaw, gyRaw, gzRaw) == true)
         {
-            sumAx += axRaw / ACCEL_SCALE;  /* Convert raw acc X to g and add */
-            sumAy += ayRaw / ACCEL_SCALE;  /* Convert raw acc Y to g and add */
-            sumAz += azRaw / ACCEL_SCALE;  /* Convert raw acc Z to g and add */
+            sumAx += axRaw / ACCEL_SCALE;  /* Convert raw acc X to g and add to sum */
+            sumAy += ayRaw / ACCEL_SCALE;  /* Convert raw acc Y to g and add to sum */
+            sumAz += azRaw / ACCEL_SCALE;  /* Convert raw acc Z to g and add to sum */
 
-            sumGx += gxRaw / GYRO_SCALE;   /* Convert raw gyro X to deg/s and add */
-            sumGy += gyRaw / GYRO_SCALE;   /* Convert raw gyro Y to deg/s and add */
-            sumGz += gzRaw / GYRO_SCALE;   /* Convert raw gyro Z to deg/s and add */
+            sumGx += gxRaw / GYRO_SCALE;   /* Convert raw gyro X to deg/s and add to sum */
+            sumGy += gyRaw / GYRO_SCALE;   /* Convert raw gyro Y to deg/s and add to sum */
+            sumGz += gzRaw / GYRO_SCALE;   /* Convert raw gyro Z to deg/s and add to sum */
 
-            validSamples++;                /* Increase valid samples count */
+            validSamples++;                /* Increase valid sample count */
         }
 
         delay(2);                          /* Small delay between calibration samples */
@@ -186,28 +200,34 @@ void calibrateSensor(int numSamples = 500)
     if (validSamples == 0)                 /* Check if calibration failed */
     {
         Serial.println("CALIBRATION_FAILED");
-        return;
+        return;                            /* Exit calibration function */
     }
 
-    accelBiasX = sumAx / validSamples;     /* X should be 0g in idle, so average is bias */
-    accelBiasY = sumAy / validSamples;     /* Y should be 0g in idle, so average is bias */
-    accelBiasZ = (sumAz / validSamples) - 1.0f; /* Z should be 1g in idle, keep gravity */
+    accelBiasX = sumAx / validSamples;     /* Calculate X bias while idle should be 0g */
+    accelBiasY = sumAy / validSamples;     /* Calculate Y bias while idle should be 0g */
+    accelBiasZ = (sumAz / validSamples) - 1.0f; /* Keep gravity on Z while removing bias */
 
-    gyroBiasX = sumGx / validSamples;      /* Gyro X should be 0 deg/s */
-    gyroBiasY = sumGy / validSamples;      /* Gyro Y should be 0 deg/s */
-    gyroBiasZ = sumGz / validSamples;      /* Gyro Z should be 0 deg/s */
+    gyroBiasX = sumGx / validSamples;      /* Calculate gyro X bias */
+    gyroBiasY = sumGy / validSamples;      /* Calculate gyro Y bias */
+    gyroBiasZ = sumGz / validSamples;      /* Calculate gyro Z bias */
 
     Serial.println("CALIBRATION_DONE");
+
     Serial.print("AccelBiasX=");
     Serial.println(accelBiasX, 4);
+
     Serial.print("AccelBiasY=");
     Serial.println(accelBiasY, 4);
+
     Serial.print("AccelBiasZ=");
     Serial.println(accelBiasZ, 4);
+
     Serial.print("GyroBiasX=");
     Serial.println(gyroBiasX, 4);
+
     Serial.print("GyroBiasY=");
     Serial.println(gyroBiasY, 4);
+
     Serial.print("GyroBiasZ=");
     Serial.println(gyroBiasZ, 4);
 }
@@ -224,7 +244,7 @@ void initializeFilterWithFirstSample()
     if (mpuReadRaw(axRaw, ayRaw, azRaw, gxRaw, gyRaw, gzRaw) == false)
     {
         Serial.println("FILTER_INIT_FAILED");
-        return;
+        return;                            /* Exit if first reading failed */
     }
 
     filtAx = (axRaw / ACCEL_SCALE) - accelBiasX; /* Initialize filtered acc X */
@@ -239,38 +259,45 @@ void initializeFilterWithFirstSample()
 }
 
 /* =========================
-   Arduino Setup
+   Arduino setup()
    ========================= */
 
 void setup()
 {
-    Serial.begin(115200);                  /* Start serial communication */
+    Serial.begin(115200);                  /* Start Serial Monitor */
     delay(1000);                           /* Wait for Serial Monitor */
 
-    Wire.begin(SDA_PIN, SCL_PIN);          /* Start I2C with selected pins */
-    Wire.setClock(400000);                 /* Set I2C speed to 400 kHz */
+    Wire.begin(SDA_PIN, SCL_PIN);          /* Start I2C communication */
+    Wire.setClock(100000);                 /* Use 100 kHz for stable I2C during movement */
+
+    mpuWriteByte(REG_PWR_MGMT_1, 0x80);    /* Reset MPU6050 */
+    delay(100);                            /* Wait after reset */
 
     mpuWriteByte(REG_PWR_MGMT_1, 0x00);    /* Wake up MPU6050 */
-    delay(100);                            /* Wait for sensor startup */
+    delay(100);                            /* Wait after wake up */
 
-    uint8_t whoAmI = mpuReadByte(REG_WHO_AM_I); /* Read sensor ID */
+    uint8_t whoAmI = mpuReadByte(REG_WHO_AM_I); /* Read WHO_AM_I register */
 
     Serial.print("WHO_AM_I=0x");
     Serial.println(whoAmI, HEX);
 
-    if (whoAmI != 0x68)                    /* Check MPU6050 identity */
+    if (whoAmI != 0x68)                    /* Check if MPU6050 is detected */
     {
         Serial.println("ERROR_MPU6050_NOT_FOUND");
-        while (1)
+
+        while (1)                          /* Stop program if sensor not found */
         {
             delay(1000);
         }
     }
 
-    mpuWriteByte(REG_ACCEL_CONFIG, 0x00);  /* Set accelerometer range to +/-2g */
+    mpuWriteByte(REG_ACCEL_CONFIG, 0x10);  /* Set accelerometer range to +/-8g */
     mpuWriteByte(REG_GYRO_CONFIG, 0x00);   /* Set gyroscope range to +/-250 deg/s */
 
-    calibrateSensor(500);                  /* Calibrate in official idle position */
+    Serial.println("ACCEL_RANGE=+/-8g");
+    Serial.println("GYRO_RANGE=+/-250dps");
+
+    calibrateSensor(500);                  /* Calibrate sensor in neutral idle position */
 
     initializeFilterWithFirstSample();     /* Start filter from first real sample */
 
@@ -282,7 +309,7 @@ void setup()
 }
 
 /* =========================
-   Arduino Loop
+   Arduino loop()
    ========================= */
 
 void loop()
@@ -294,7 +321,7 @@ void loop()
     {
         Serial.println("SENSOR_READ_FAILED");
         delay(SAMPLE_DELAY_MS);
-        return;
+        return;                            /* Skip this loop if reading failed */
     }
 
     float ax = (axRaw / ACCEL_SCALE) - accelBiasX; /* Convert acc X to g and remove bias */
@@ -323,7 +350,7 @@ void loop()
                   filtGx,
                   filtGy,
                   filtGz,
-                  CURRENT_LABEL);          /* Print CSV row */
+                  CURRENT_LABEL);          /* Print one CSV row */
 
-    delay(SAMPLE_DELAY_MS);                /* Wait until next sample */
+    delay(SAMPLE_DELAY_MS);                /* Wait before next sample */
 }
